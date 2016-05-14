@@ -107,13 +107,22 @@ kube-aws status
 Configure kubectl to use the configuration that kube-aws generated:
 
 ```
-alias kubectl="kubectl --kubeconfig=kubeconfig"
+alias kubectl="kubectl --kubeconfig=${PWD}/kubeconfig"
 ```
 
 And access the cluster to confirm that two nodes have been registered:
 
 ```
-kubectl --kubeconfig=kubeconfig get nodes
+kubectl get nodes
+```
+
+# Launch Our Production Application
+
+## Application Monitoring
+
+```
+kubectl create -f https://raw.githubusercontent.com/kubernetes/contrib/master/prometheus/prometheus-all.json
+kubectl create -f https://raw.githubusercontent.com/kubernetes/contrib/master/prometheus/prometheus-service.json
 ```
 
 # Fire Drills
@@ -128,3 +137,17 @@ We are going to run through a series of firedrills now:
 - Upgrade of a worker machine
 - Failure of a worker machine
 - Downgrade/upgrade the kubelet
+
+# Move etcd off cluster and scale to 3 machines
+
+In AWS `kube-aws` sets etcd up on a single machine with an EBS backing store. We have found that this architecture gives reasonable performance and is easy to operate and it is our recommended setup.
+
+But, imagine for that you find you need additional scale from etcd or are designing Kubernetes for availability even in the face of individual VM failure or upgrades.
+
+First, launch an etcd cluster with a [CoreOS stack](https://coreos.com/os/docs/latest/booting-on-ec2.html).
+
+Now lets make some sort of change to the cluster:
+
+```
+kubectl scale rc guestbook --replicas=2
+```
