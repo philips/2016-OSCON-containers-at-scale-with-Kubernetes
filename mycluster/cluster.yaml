@@ -1,0 +1,95 @@
+# Unique name of Kubernetes cluster. In order to deploy
+# more than one cluster into the same AWS account, this
+# name must not conflict with an existing cluster.
+clusterName: ok-cluster
+
+# DNS name routable to the Kubernetes controller nodes
+# from worker nodes and external clients. Configure the options
+# below if you'd like kube-aws to create a Route53 record sets/hosted zones
+# for you.  Otherwise the deployer is responsible for making this name routable
+externalDNSName: k8s.ifup.org
+
+# CoreOS release channel to use. Currently supported options: [ alpha, beta ]
+# See coreos.com/releases for more information
+releaseChannel: beta
+
+# Set to true if you want kube-aws to create a Route53 A Record for you.
+#createRecordSet: false
+
+# TTL in seconds for the Route53 RecordSet created if createRecordSet is set to true.
+#recordSetTTL: 300
+
+# The name of the hosted zone to add the externalDNSName to,
+# E.g: "google.com".  This needs to already exist, kube-aws will not create
+# it for you.
+#hostedZone: ""
+
+# Name of the SSH keypair already loaded into the AWS
+# account being used to deploy this cluster.
+keyName: philips
+
+# Region to provision Kubernetes cluster
+region: us-west-2
+
+# Availability Zone to provision Kubernetes cluster
+availabilityZone: us-west-2c
+
+# ARN of the KMS key used to encrypt TLS assets.
+kmsKeyArn: "arn:aws:kms:us-west-2:334544467761:key/61af0d8f-c27a-466f-a981-81c6ceca6032"
+
+# Instance type for controller node
+#controllerInstanceType: m3.medium
+
+# Disk size (GiB) for controller node
+#controllerRootVolumeSize: 30
+
+# Number of worker nodes to create
+workerCount: 2
+
+# Instance type for worker nodes
+#workerInstanceType: m3.medium
+
+# Disk size (GiB) for worker nodes
+#workerRootVolumeSize: 30
+
+# Price (Dollars) to bid for spot instances. Omit for on-demand instances.
+# workerSpotPrice: "0.05"
+
+# ID of existing VPC to create subnet in. Leave blank to create a new VPC
+# vpcId:
+
+# ID of existing route table in existing VPC to attach subnet to. Leave blank to use the VPC's main route table.
+# routeTableId:
+
+# CIDR for Kubernetes VPC. If vpcId is specified, must match the CIDR of existing vpc.
+# vpcCIDR: "10.0.0.0/16"
+
+# CIDR for Kubernetes subnet
+# instanceCIDR: "10.0.0.0/24"
+
+# IP Address for controller in Kubernetes subnet
+# controllerIP: 10.0.0.50
+
+# CIDR for all service IP addresses
+# serviceCIDR: "10.3.0.0/24"
+
+# CIDR for all pod IP addresses
+# podCIDR: "10.2.0.0/16"
+
+# IP address of Kubernetes dns service (must be contained by serviceCIDR)
+# dnsServiceIP: 10.3.0.10
+
+# Version of hyperkube image to use. This is the tag for the hyperkube image repository.
+# kubernetesVersion: v1.2.3_coreos.0
+
+# Hyperkube image repository to use.
+# hyperkubeImageRepo: quay.io/coreos/hyperkube
+
+# Use Calico for network policy. When set to "true" the kubernetesVersion (above)
+# must also be updated to include a version tagged with CNI e.g. v1.2.3_coreos.cni.1
+# useCalico: false
+
+# AWS Tags for cloudformation stack resources 
+#stackTags:
+#  Name: "Kubernetes" 
+#  Environment: "Production"
