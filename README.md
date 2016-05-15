@@ -151,3 +151,92 @@ Now lets make some sort of change to the cluster:
 ```
 kubectl scale rc guestbook --replicas=2
 ```
+Launch with userdata
+
+```
+#cloud-config
+
+coreos:
+  etcd2:
+    # generate a new token for each unique cluster from https://discovery.etcd.io/new?size=3
+    # specify the initial size of your cluster with ?size=X
+    discovery: https://discovery.etcd.io/<token>
+    # multi-region and multi-cloud deployments need to use $public_ipv4
+    advertise-client-urls: http://$private_ipv4:2379,http://$private_ipv4:4001
+    initial-advertise-peer-urls: http://$private_ipv4:2380
+    # listen on both the official ports and the legacy ports
+    # legacy ports can be omitted if your application doesn't depend on them
+    listen-client-urls: http://0.0.0.0:2379,http://0.0.0.0:4001
+    listen-peer-urls: http://$private_ipv4:2380,http://$private_ipv4:7001
+```
+
+Get the list of instances for your worker machines
+
+```
+aws ec2 describe-instances --filter "Name=tag:aws:cloudformation:stack-name,Values=etcd-cluster" --output text | grep INSTANCES | awk '{print $14 }' > instance-list; cat instance-list
+```
+
+Place the backup on the new host
+
+```
+first=$(head -n 1 < instance-list )
+ssh -A core@k8s.ifup.org  "sudo etcdctl backup --data-dir /var/lib/etcd2 --backup-dir backup; sudo cp -R /var/lib/etcd2/member/wal/ backup/member/; sudo chmod -R 777 backup; scp  -r  -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no backup $first:"
+```
+
+```
+ssh $first
+sudo su
+rm -Rf /var/lib/etcd2/
+cp -Ra /home/core/backup/ /var/lib/etcd2
+chown -R etcd: /var/lib/etcd2
+source /etc/environment
+machine=$(cat /etc/machine-id)
+echo -e "[Service]\nEnvironment=ETCD_FORCE_NEW_CLUSTER=1 ETCD_INITIAL_CLUSTER=${machine}=http://${COREOS_PRIVATE_IPV4}:2380" > /run/systemd/system/etcd2.service.d/90-new-cluster.conf
+sudo systemctl daemon-reload
+sudo systemctl restart etcd2
+```
+
+```
+sudo rm /run/systemd/system/etcd2.service.d/90-new-cluster.conf
+sudo systemctl daemon-reload
+```
+
+```
+echo etcdctl member add $(cat /etc/machine-id) http://$(ip addr | grep "inet 10" | awk '{print $2}' | awk -F '/' '{print $1}'):2380
+```
+
+```
+```
+
+On first run this command
+
+```
+etcdctl member add ... > member
+echo
+echo '[Service]'
+cat member | grep ETCD_ | awk '{gsub(/\"/, ""); printf "Environment=%s\n", $1}'
+```
+
+Create the systemd unit based on this
+
+```
+ETCD_NAME="c2124f7e340f40a882ec163f446bbe80"
+ETCD_INITIAL_CLUSTER="c2124f7e340f40a882ec163f446bbe80=http://10.30.19.183:2380,9caf733599824fbc902fdf8deb75f934=http://10.17.15.123:2380,31eb39a0f15f43a5915daaa2767e41d8=http://10.83.4.180:2380"
+ETCD_INITIAL_CLUSTER_STATE="existing"
+```
+
+- generate systemd stub
+
+
+- put the updated configs on the machine
+
+
+- get the cluster running
+
+```
+```
+
+- add an elb
+- update the running cluster dns to point at new etcd
+- restart the API server
+- success
