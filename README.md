@@ -121,6 +121,7 @@ alias kubectl="kubectl --kubeconfig=${PWD}/kubeconfig"
 ```
 
 And access the cluster to confirm that two nodes have been registered:
+Note: Navigate out of mycluster folder first 
 
 ```
 kubectl get nodes
