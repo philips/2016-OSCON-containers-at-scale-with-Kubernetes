@@ -13,7 +13,7 @@ We are going to turn on three CoreOS VMs under AWS. Then we will deploy a simple
 
 **AWS CLI**
 
-Test that we have a keypair that works and is avaiable in our 
+Test that we have a keypair that works and is avaiable in our region:
 
 ```
 aws ec2 --region us-west-2 describe-key-pairs
@@ -128,18 +128,114 @@ kubectl get nodes
 
 # Launch Our Production Application
 
-## Application Monitoring
+With the cluster up launching the application is easy. The guestbook directory has everything needed to launch the app:
 
 ```
-kubectl create -f https://raw.githubusercontent.com/kubernetes/contrib/master/prometheus/prometheus-all.json
-kubectl create -f https://raw.githubusercontent.com/kubernetes/contrib/master/prometheus/prometheus-service.json
+cd ../guestbook
+kubectl create -f guestbook-controller.json
+kubectl create -f guestbook-service.json
+kubectl create -f redis-master-controller.json
+kubectl create -f redis-master-service.json
+kubectl create -f redis-slave-controller.json
+kubectl create -f redis-slave-service.json
 ```
+
+This will create a ELB that we can hit. But, it will take a few moments for everything to start, DNS to resolve and for health check to put stuff into the LB. While we are waiting lets dig through the app configurations.
+
+*Read through each JSON file in turn, explaining the layout of the app*.
+
+Now that we have a sense of how everything works try to go to the ELB console page and take a look at the health checks:
+
+https://us-west-2.console.aws.amazon.com/ec2/v2/home?region=us-west-2#LoadBalancers:
+
+Now that everything is up and running hit the ELB URL in your browser.
+
+
+```
+aws elb describe-load-balancers | jq '"http://" + .LoadBalancerDescriptions[].DNSName' -r
+http://a8eedeefe1b4d11e685410a4b212ca4d-2012685803.us-west-2.elb.amazonaws.com
+```
+
+# Understand the Network
+
+Port-forward cluster local DNS to your workstation.
+
+```
+kubectl port-forward --namespace=kube-system $( kubectl get pods --namespace=kube-system -l k8s-app=kube-dns -o template --template="{{range.items}}{{.metadata.name}}{{end}}") 5300:53
+```
+
+Try and grab the redis-master service powering our website:
+
+```
+dig +vc -p 5300 @127.0.0.1  redis-master.default.svc.cluster.local
+redis-master.default.svc.cluster.local. 30 IN A 10.3.0.25
+```
+
+For more [network debugging tips see this page](https://github.com/coreos/docs/blob/master/kubernetes/network-troubleshooting.md).
 
 # Fire Drills
 
 We are going to run through a series of firedrills now:
 
-- Recover etcd from a backup
+## Recover etcd from Backup
+
+Login to our control machine and stop etcd.
+
+```
+ssh core@mycluster.example.com
+systemctl stop etcd2.service
+```
+
+Lets take a backup of the etcd data directory now. We will use this to simulate replacing etcd from backup in a moment.
+
+```
+cp -Ra /var/lib/etcd2 etcd2-backup
+```
+
+```
+kubectl get pods
+Error from server: client: etcd cluster is unavailable or misconfigured
+```
+
+And even with etcd down DNS will continue to be served.
+
+```
+dig +vc -p 5300 @127.0.0.1  redis-master.default.svc.cluster.local
+```
+
+Bring etcd back up and kubectl get pods work again:
+
+```
+kubectl get pods 
+```
+
+If cluster state is edit, say by adding a label to a replication controller, then killing a pod:
+
+```
+$ kubectl edit rc guestbook
+replicationcontroller "guestbook" edited
+$ kubectl get pods -l oscon=fun
+$ kubectl delete pod guestbook-63bjl
+pod "guestbook-63bjl" deleted
+$ kubectl get pods -l oscon=fun
+NAME              READY     STATUS    RESTARTS   AGE
+guestbook-o95oz   1/1       Running   0          5s
+```
+
+At this point the etcd data on disk has diverged from the state in the current etcd. What will happen to the app?
+
+```
+systemctl stop etcd2
+rm -Rf /var/lib/etcd2
+cp -Ra etcd2-backup/ /var/lib/etcd2
+reboot
+```
+
+The cluster reconciled to the previous state at the time the backup was taken. Again, without application downtime.
+
+```
+$ kubectl get pods -l oscon=fun
+```
 
 ## Simulate an API server failure
 
@@ -167,7 +263,7 @@ kubectl describe pods --namespace=kube-system kube-apiserver-ip-10-0-0-50.us-wes
 Next, ssh into the control machine, find the PID of the API server, and kill it.
 
 ```
-ssh mycluster.example.com
+ssh core@mycluster.example.com
 ps aux | grep "hyperkube apiserver"
 root     21335  2.9  2.1 389708 83808
 ```
@@ -189,112 +285,302 @@ Furthermore! The service we are running should remain fully available.
 
 ![](img/lb-healthy.png)
 
-## Simulate failure of scheduler
-- Simulate failure of controller manager
-- Move etcd off cluster and scale to 3 machines
-- Upgrade of a worker machine
-- Failure of a worker machine
-- Downgrade/upgrade the kubelet
+## Simulate Failure of Scheduler
 
-# Move etcd off cluster and scale to 3 machines
+The scheduler's job is to land work on to machines that can run them. When it fails new work doesn't land. Lets simulate a bug in the scheduler and see what happens.
 
-In AWS `kube-aws` sets etcd up on a single machine with an EBS backing store. We have found that this architecture gives reasonable performance and is easy to operate and it is our recommended setup.
-
-But, imagine for that you find you need additional scale from etcd or are designing Kubernetes for availability even in the face of individual VM failure or upgrades.
-
-First, launch an etcd cluster with a [CoreOS stack](https://coreos.com/os/docs/latest/booting-on-ec2.html).
-
-Now lets make some sort of change to the cluster:
+Temporarily disable the scheduler by removing it from the controller manifests:
 
 ```
-kubectl scale rc guestbook --replicas=2
-```
-Launch with userdata
-
-```
-#cloud-config
-
-coreos:
-  etcd2:
-    # generate a new token for each unique cluster from https://discovery.etcd.io/new?size=3
-    # specify the initial size of your cluster with ?size=X
-    discovery: https://discovery.etcd.io/<token>
-    # multi-region and multi-cloud deployments need to use $public_ipv4
-    advertise-client-urls: http://$private_ipv4:2379,http://$private_ipv4:4001
-    initial-advertise-peer-urls: http://$private_ipv4:2380
-    # listen on both the official ports and the legacy ports
-    # legacy ports can be omitted if your application doesn't depend on them
-    listen-client-urls: http://0.0.0.0:2379,http://0.0.0.0:4001
-    listen-peer-urls: http://$private_ipv4:2380,http://$private_ipv4:7001
+ssh core@mycluster.example.com
+mv /etc/kubernetes/manifests/kube-scheduler.yaml /tmp
 ```
 
-Get the list of instances for your worker machines
+**Note**: in the near future of [self-hosted Kubernetes](https://www.youtube.com/watch?v=A49xXiKZNTQ&t=360s) you will be able to do this using kubectl!
+
+Now, lets try and scale our application from 3 processes to 5. 
 
 ```
-aws ec2 describe-instances --filter "Name=tag:aws:cloudformation:stack-name,Values=etcd-cluster" --output text | grep INSTANCES | awk '{print $14 }' > instance-list; cat instance-list
+kubectl scale rc guestbook --replicas=5
+replicationcontroller "guestbook" scaled
 ```
 
-Place the backup on the new host
+Looks like it worked great! Lets check it out!
 
 ```
-first=$(head -n 1 < instance-list )
-ssh -A core@k8s.ifup.org  "sudo etcdctl backup --data-dir /var/lib/etcd2 --backup-dir backup; sudo cp -R /var/lib/etcd2/member/wal/ backup/member/; sudo chmod -R 777 backup; scp  -r  -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no backup $first:"
+kubectl get rc
+NAME              DESIRED   CURRENT   AGE
+guestbook         5         5         4h
+```
+
+Unfortunately, none of these new processes are starting up! What is going on?
+
+```
+kubectl get pods -l app=guestbook
+NAME              READY     STATUS    RESTARTS   AGE
+guestbook-4z4gp   0/1       Pending   0          1m
+guestbook-5plrs   0/1       Pending   0          1m
+guestbook-ajqqo   1/1       Running   0          4h
+guestbook-rrbv4   1/1       Running   0          4h
+guestbook-u6h2o   1/1       Running   0          4h
+```
+
+Scaling happens separately from scheduling. So, what has happened is that the controller manager has created these new pods based on the new desired state. But, no process is running to schedule these new pods.
+
+Moving the scheduler back into place will resolve the issue:
+
+```
+ssh core@mycluster.example.com
+mv /tmp/kube-scheduler.yaml /etc/kubernetes/manifests/
+```
+
+And there the scheduler goes, the processes are now running:
+
+```
+kubectl get pods -l app=guestbook
+NAME              READY     STATUS    RESTARTS   AGE
+guestbook-4z4gp   1/1       Running   0          13m
+guestbook-5plrs   1/1       Running   0          13m
+guestbook-ajqqo   1/1       Running   0          4h
+guestbook-rrbv4   1/1       Running   0          4h
+guestbook-u6h2o   1/1       Running   0          4h
+```
+
+## Simulate Failure of Controller Manager
+
+The controller manager's job is to reconcile the current state of the system with the user's desired state. Primarily this means it is looking for over/under serviced replication controllers and replica sets and destroying/creating pods.
+
+Temporarily disable the controller manager by removing it from the controller manifests:
+
+```
+ssh core@mycluster.example.com
+mv /etc/kubernetes/manifests/kube-controller-manager.yaml /tmp
+```
+
+**Note**: in the near future of [self-hosted Kubernetes](https://www.youtube.com/watch?v=A49xXiKZNTQ&t=360s) you will be able to do this using kubectl!
+
+Now, lets try and scale our application from 5 pods to 3.
+
+```
+kubectl scale rc guestbook --replicas=3
+replicationcontroller "guestbook" scaled
+```
+
+Looks like it worked great! Lets check it out!
+
+```
+kubectl get rc
+NAME              DESIRED   CURRENT   AGE
+guestbook         5         5         4h
+```
+
+Unfortunately, none of the old processes are stopping! What is going on?
+
+```
+kubectl get pods -l app=guestbook
+NAME              READY     STATUS    RESTARTS   AGE
+guestbook-4z4gp   1/1       Running   0          14m
+guestbook-5plrs   1/1       Running   0          14m
+guestbook-ajqqo   1/1       Running   0          4h
+guestbook-rrbv4   1/1       Running   0          4h
+guestbook-u6h2o   1/1       Running   0          4h
+```
+
+Delete three pods:
+
+```
+kubectl delete pod guestbook-4z4gp 
+kubectl delete pod guestbook-ajqqo
+kubectl delete pod guestbook-u6h2o
+```
+
+Oops, this deleted too many pods in fact. Now the cluster has even fewer running pods than desired. This is a potential danger of having the controller manager down. Lets recover the controller manager to get this going again!
+
+```
+kubectl get pods -l app=guestbook
+NAME              READY     STATUS    RESTARTS   AGE
+guestbook-5plrs   1/1       Running   0          18m
+guestbook-rrbv4   1/1       Running   0          4h
+```
+
+Moving the controller manager back into place will resolve the issue:
+
+```
+ssh core@mycluster.example.com
+mv /tmp/kube-controller-manager.yaml /etc/kubernetes/manifests/
+```
+
+And there the manager goes, the new pods are created and now running:
+
+```
+kubectl get pods -l app=guestbook
+NAME              READY     STATUS    RESTARTS   AGE
+guestbook-36c3s   1/1       Running   1          4s
+guestbook-5plrs   1/1       Running   0          19m
+guestbook-rrbv4   1/1       Running   0          4h
+```
+
+## Scaling Cluster Up
+
+Scaling the cluster up is pretty easy using AWS Auto Scaling Groups. Find the name of the autoscale group using the aws cli:
+
+```
+aws autoscaling describe-auto-scaling-groups  | jq .AutoScalingGroups[].AutoScalingGroupARN -c -r
+arn:aws:autoscaling:us-west-2:334544467761:autoScalingGroup:04f1009d-2ae8-4265-8e99-72395229a7b9:autoScalingGroupName/mycluster-AutoScaleWorker-RDWPOE65KS2M
+```
+
+Then use that name to scale the cluster up to 3 machines:
+
+```
+aws autoscaling update-auto-scaling-group --auto-scaling-group-name myluster-AutoScaleWorker-RDWPOE65KS2M --min-size 3 --max-size 3
+```
+
+After a few minutes this machine will appear in the node list. But, how does this magic happen?!
+
+To bootstrap into the cluster a machine only needs a little bit of metadata. This metadata is passed in via AWS userdata. Lets take a look!
+
+First, find out the LaunchConfigurationWorker name:
+
+```
+aws autoscaling describe-auto-scaling-groups  | jq .AutoScalingGroups[].LaunchConfigurationName -c -r
+ok-cluster-LaunchConfigurationWorker-7N3BDQZ1UZ2
+```
+
+Then dump out the base64 endcoded User Data:
+
+```
+aws autoscaling describe-launch-configurations --launch-configuration-names ok-cluster-LaunchConfigurationWorker-7N3BDQZ1UZ2 | jq .LaunchConfigurations[].UserData -r  | base64 -D | gzip -d
+```
+
+In here we are going to find some interesting sections:
+
+- IP address of the control machine
+- Setup of the x509 certificates and decrypting with AWS KMS
+- Version number of the kubelet to run
+- Configuration of the flannel network
+
+## Simulate Planned Upgrade of a Worker
+
+The cluster will have three members
+
+```
+$ kubectl get nodes
+NAME                                       STATUS                     AGE
+ip-10-0-0-227.us-west-2.compute.internal   Ready                      1d
+ip-10-0-0-228.us-west-2.compute.internal   Ready                      1d
+ip-10-0-0-50.us-west-2.compute.internal    Ready,SchedulingDisabled   1d
+```
+
+Choose one of the machines and tell Kubernetes to drain work off of it:
+
+```
+$ kubectl drain ip-10-0-0-228.us-west-2.compute.internal --force
+node "ip-10-0-0-228.us-west-2.compute.internal" cordoned
+```
+
+After draining the node should get no additional work as it will be labeled "SchedulingDisabled":
+
+```
+$ kubectl get nodes
+NAME                                       STATUS                     AGE
+ip-10-0-0-228.us-west-2.compute.internal   Ready,SchedulingDisabled   1d
+```
+
+Lets uncordon the machine and get it back into the load balancer:
+
+```
+$ kubectl uncordon ip-10-0-0-228.us-west-2.compute.internal
+node "ip-10-0-0-228.us-west-2.compute.internal" uncordoned
+```
+
+During this exercise we will see that the machine went from Healthy to Unhealthy to back in our application ELB:
+
+![](img/lb-drain.png)
+
+## Failure of a Worker Machine
+
+Choose a worker machine at random to be part of this test:
+
+```
+kubectl get nodes
+NAME                                       STATUS                     AGE
+ip-10-0-0-231.us-west-2.compute.internal   Ready                      1d
+```
+
+Find the public IP of the random worker machine.
+
+```
+kubectl describe node ip-10-0-0-231.us-west-2.compute.internal  | grep Addresses
+Addresses:      10.0.0.231,10.0.0.231,52.39.160.184
+```
+
+Stop the kubelet which will cause it to stop sending heartbeats to the control plan:
+
+```
+ssh 52.39.160.184 -l core sudo systemctl stop kubelet
 ```
 
 ```
-ssh $first
-sudo su
-rm -Rf /var/lib/etcd2/
-cp -Ra /home/core/backup/ /var/lib/etcd2
-chown -R etcd: /var/lib/etcd2
-source /etc/environment
-machine=$(cat /etc/machine-id)
-echo -e "[Service]\nEnvironment=ETCD_FORCE_NEW_CLUSTER=1 ETCD_INITIAL_CLUSTER=${machine}=http://${COREOS_PRIVATE_IPV4}:2380" > /run/systemd/system/etcd2.service.d/90-new-cluster.conf
-sudo systemctl daemon-reload
-sudo systemctl restart etcd2
+kubectl events -w
+FIRSTSEEN                       LASTSEEN                        COUNT     NAME                                       KIND      SUBOBJECT   TYPE      REASON         SOURCE                 MESSAGE
+2016-05-16 06:07:56 -0500 CDT   2016-05-16 06:07:56 -0500 CDT   1         ip-10-0-0-231.us-west-2.compute.internal   Node                  Normal    NodeNotReady   {controllermanager }   Node ip-10-0-0-231.us-west-2.compute.internal status is now: NodeNotReady
+2016-05-16 05:54:14 -0500 CDT   2016-05-16 06:08:04 -0500 CDT   5         guestbook   Service             Normal    UpdatedLoadBalancer   {service-controller }   Updated load balancer with new hosts
 ```
 
-```
-sudo rm /run/systemd/system/etcd2.service.d/90-new-cluster.conf
-sudo systemctl daemon-reload
-```
+This happens after about 1 minute. Then we need to wait 5 minutes more for the Controller Manager to remove load from the machine. Look at the [docs](http://kubernetes.io/docs/admin/kube-controller-manager/) for details on how that can be tweaked.
 
 ```
-echo etcdctl member add $(cat /etc/machine-id) http://$(ip addr | grep "inet 10" | awk '{print $2}' | awk -F '/' '{print $1}'):2380
+kubectl get events
+2m          2m         1         ip-10-0-0-231.us-west-2.compute.internal   Node                                                       Normal    TerminatingEvictedPod    {controllermanager }                                    Node ip-10-0-0-231.us-west-2.compute.internal event: Pod guestbook-63bjl has exceeded the grace period for deletion after being evicted from Node "ip-10-0-0-231.us-west-2.compute.internal" and is being force killed
+2m          2m         1         ip-10-0-0-231.us-west-2.compute.internal   Node                                                       Normal    TerminatingEvictedPod    {controllermanager }                                    Node ip-10-0-0-231.us-west-2.compute.internal event: Pod kube-prometheus-ld49x has exceeded the grace period for deletion after being evicted from Node "ip-10-0-0-231.us-west-2.compute.internal" and is being force killed
+2m          2m         1         ip-10-0-0-231.us-west-2.compute.internal   Node                                                       Normal    TerminatingEvictedPod    {controllermanager }                                    Node ip-10-0-0-231.us-west-2.compute.internal event: Pod redis-master-kq5n1 has exceeded the grace period for deletion after being evicted from Node "ip-10-0-0-231.us-west-2.compute.internal" and is being force killed
+2m          2m         1         ip-10-0-0-231.us-west-2.compute.internal   Node                                                       Normal    TerminatingEvictedPod    {controllermanager }                                    Node ip-10-0-0-231.us-west-2.compute.internal event: Pod kube-proxy-ip-10-0-0-231.us-west-2.compute.internal has exceeded the grace period for deletion after being evicted from Node "ip-10-0-0-231.us-west-2.compute.internal" and is being force killed
+2m          2m         1         ip-10-0-0-231.us-west-2.compute.internal   Node
 ```
 
-```
-```
 
-On first run this command
+Put the machine back in rotation by restarting the kubelet:
 
 ```
-etcdctl member add ... > member
-echo
-echo '[Service]'
-cat member | grep ETCD_ | awk '{gsub(/\"/, ""); printf "Environment=%s\n", $1}'
+ssh 52.39.160.184 -l core sudo systemctl restart kubelet
 ```
 
-Create the systemd unit based on this
+And the machine will re-enter the cluster:
 
 ```
-ETCD_NAME="c2124f7e340f40a882ec163f446bbe80"
-ETCD_INITIAL_CLUSTER="c2124f7e340f40a882ec163f446bbe80=http://10.30.19.183:2380,9caf733599824fbc902fdf8deb75f934=http://10.17.15.123:2380,31eb39a0f15f43a5915daaa2767e41d8=http://10.83.4.180:2380"
-ETCD_INITIAL_CLUSTER_STATE="existing"
+kubectl describe  node ip-10-0-0-227.us-west-2.compute.internal
 ```
 
-- generate systemd stub
+## Downgrade/Upgrade the Kubelet
 
-
-- put the updated configs on the machine
-
-
-- get the cluster running
+Choose a worker machine at random to be part of this test:
 
 ```
+kubectl get nodes
+NAME                                       STATUS                     AGE
+ip-10-0-0-227.us-west-2.compute.internal   Ready                      1d
 ```
 
-- add an elb
-- update the running cluster dns to point at new etcd
-- restart the API server
-- success
+Find the public IP of the random worker machine.
+
+```
+kubectl describe node ip-10-0-0-227.us-west-2.compute.internal  | grep Addresses
+Addresses:      10.0.0.227,10.0.0.227,52.39.138.102
+```
+
+ssh into the hosts public and change the version of the kubelet in the service file, reboot the kubelet (or node)
+
+```
+ssh core@52.39.138.102
+sudo vim /etc/systemd/system/kubelet.service
+sudo systemctl daemon-reload && sudo systemctl restart kubelet
+sudo journalctl -u kubelet -f
+```
+
+Confirm that the kubelet reports the new version:
+
+```
+kubectl describe node ip-10-0-0-227.us-west-2.compute.internal | grep "Kubelet Version"
+```
+
+Once a single machine is tested consider updating the autoscaling group.
